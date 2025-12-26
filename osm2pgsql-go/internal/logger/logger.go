@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 var (
@@ -16,26 +15,21 @@ var (
 // Init initializes the global logger
 func Init(debug bool) {
 	once.Do(func() {
-		var config zap.Config
+		var logger *zap.Logger
+		var err error
 
 		if debug {
-			config = zap.NewDevelopmentConfig()
-			config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+			logger, err = zap.NewDevelopment()
 		} else {
-			config = zap.NewProductionConfig()
-			config.EncoderConfig.TimeKey = "time"
-			config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+			// Use development config but at info level for readable output
+			cfg := zap.NewDevelopmentConfig()
+			cfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+			cfg.DisableCaller = true
+			cfg.DisableStacktrace = true
+			logger, err = cfg.Build()
 		}
 
-		// Use console encoding for CLI-friendly output
-		config.Encoding = "console"
-		config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-		config.OutputPaths = []string{"stdout"}
-		config.ErrorOutputPaths = []string{"stderr"}
-
-		logger, err := config.Build()
 		if err != nil {
-			// Fallback to basic logger
 			logger = zap.NewExample()
 		}
 

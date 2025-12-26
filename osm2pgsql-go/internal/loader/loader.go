@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/apache/arrow/go/v14/arrow"
 	"github.com/apache/arrow/go/v14/arrow/array"
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/apache/arrow/go/v14/parquet/pqarrow"
@@ -262,12 +261,19 @@ func (l *Loader) copyFromParquet(ctx context.Context, conn *pgx.Conn, tableName,
 		return 0, fmt.Errorf("failed to create arrow reader: %w", err)
 	}
 
-	// Check schema to determine if WKB or WKT
-	schema, err := arrowReader.Schema()
+	// Read entire table
+	tbl, err := arrowReader.ReadTable(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get schema: %w", err)
+		return 0, fmt.Errorf("failed to read table: %w", err)
+	}
+	defer tbl.Release()
+
+	if tbl.NumRows() == 0 {
+		return 0, nil
 	}
 
+	// Check schema to determine if WKB or WKT
+	schema := tbl.Schema()
 	isWKB := false
 	for _, field := range schema.Fields() {
 		if field.Name == "geom_wkb" {
@@ -315,64 +321,41 @@ func (l *Loader) copyFromParquet(ctx context.Context, conn *pgx.Conn, tableName,
 
 	// Create channel for streaming rows
 	rowChan := make(chan []interface{}, 10000)
-	errChan := make(chan error, 1)
 	var count atomic.Int64
 
-	// Start goroutine to read from Parquet and send to channel
+	// Start goroutine to read from table and send to channel
 	go func() {
 		defer close(rowChan)
 
-		// Get column indices
-		osmIDIdx := schema.FieldIndices("osm_id")[0]
-		osmTypeIdx := schema.FieldIndices("osm_type")[0]
-		tagsIdx := schema.FieldIndices("tags")[0]
-		var geomIdx int
-		if isWKB {
-			geomIdx = schema.FieldIndices("geom_wkb")[0]
-		} else {
-			geomIdx = schema.FieldIndices("geom_wkt")[0]
-		}
+		// Get columns as chunked arrays
+		osmIDCol := tbl.Column(0).Data()
+		osmTypeCol := tbl.Column(1).Data()
+		tagsCol := tbl.Column(2).Data()
+		geomCol := tbl.Column(3).Data()
 
-		// Read record batches
-		rr, err := arrowReader.GetRecordReader(ctx, nil, nil)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to get record reader: %w", err)
-			return
-		}
-		defer rr.Release()
+		// Iterate through all chunks
+		numChunks := len(osmIDCol.Chunks())
+		for chunkIdx := 0; chunkIdx < numChunks; chunkIdx++ {
+			idChunk := osmIDCol.Chunk(chunkIdx).(*array.Int64)
+			typeChunk := osmTypeCol.Chunk(chunkIdx).(*array.String)
+			tagsChunk := tagsCol.Chunk(chunkIdx).(*array.String)
 
-		for rr.Next() {
-			rec := rr.Record()
-
-			osmIDCol := rec.Column(osmIDIdx).(*array.Int64)
-			osmTypeCol := rec.Column(osmTypeIdx).(*array.String)
-			tagsCol := rec.Column(tagsIdx).(*array.String)
-			var geomCol arrow.Array
-			if isWKB {
-				geomCol = rec.Column(geomIdx)
-			} else {
-				geomCol = rec.Column(geomIdx)
-			}
-
-			for i := 0; i < int(rec.NumRows()); i++ {
-				osmID := osmIDCol.Value(i)
-				osmType := osmTypeCol.Value(i)
-				tags := tagsCol.Value(i)
+			chunkLen := idChunk.Len()
+			for i := 0; i < chunkLen; i++ {
+				osmID := idChunk.Value(i)
+				osmType := typeChunk.Value(i)
+				tags := tagsChunk.Value(i)
 
 				var geomData interface{}
 				if isWKB {
-					geomData = geomCol.(*array.Binary).Value(i)
+					geomData = geomCol.Chunk(chunkIdx).(*array.Binary).Value(i)
 				} else {
-					geomData = geomCol.(*array.String).Value(i)
+					geomData = geomCol.Chunk(chunkIdx).(*array.String).Value(i)
 				}
 
 				rowChan <- []interface{}{osmID, osmType, tags, geomData}
 				count.Add(1)
 			}
-		}
-
-		if err := rr.Err(); err != nil && err.Error() != "EOF" {
-			errChan <- fmt.Errorf("record reader error: %w", err)
 		}
 	}()
 
@@ -388,19 +371,10 @@ func (l *Loader) copyFromParquet(ctx context.Context, conn *pgx.Conn, tableName,
 		ctx,
 		pgx.Identifier{tempTable},
 		copyColumns,
-		&rowSource{rows: rowChan, errChan: errChan},
+		&rowSource{rows: rowChan},
 	)
 	if err != nil {
 		return 0, fmt.Errorf("COPY failed: %w", err)
-	}
-
-	// Check for errors from the reader goroutine
-	select {
-	case err := <-errChan:
-		if err != nil {
-			return 0, err
-		}
-	default:
 	}
 
 	// Insert from temp table to final table with geometry conversion
@@ -444,23 +418,16 @@ func (l *Loader) copyFromParquet(ctx context.Context, conn *pgx.Conn, tableName,
 // rowSource implements pgx.CopyFromSource for streaming rows
 type rowSource struct {
 	rows    <-chan []interface{}
-	errChan <-chan error
 	current []interface{}
-	err     error
 }
 
 func (r *rowSource) Next() bool {
-	select {
-	case err := <-r.errChan:
-		r.err = err
+	row, ok := <-r.rows
+	if !ok {
 		return false
-	case row, ok := <-r.rows:
-		if !ok {
-			return false
-		}
-		r.current = row
-		return true
 	}
+	r.current = row
+	return true
 }
 
 func (r *rowSource) Values() ([]interface{}, error) {
@@ -468,5 +435,5 @@ func (r *rowSource) Values() ([]interface{}, error) {
 }
 
 func (r *rowSource) Err() error {
-	return r.err
+	return nil
 }
