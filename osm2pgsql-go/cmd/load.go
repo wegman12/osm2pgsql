@@ -3,6 +3,8 @@ package cmd
 import (
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/loader"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	"github.com/spf13/cobra"
@@ -37,12 +39,12 @@ func init() {
 func runLoad(cmd *cobra.Command, args []string) {
 	log := logger.Get()
 	log.Info("Starting PostgreSQL load",
-		"input_dir", cfg.OutputDir,
-		"database", cfg.DBName,
-		"host", cfg.DBHost,
-		"port", cfg.DBPort,
-		"user", cfg.DBUser,
-		"schema", cfg.DBSchema,
+		zap.String("input_dir", cfg.OutputDir),
+		zap.String("database", cfg.DBName),
+		zap.String("host", cfg.DBHost),
+		zap.Int("port", cfg.DBPort),
+		zap.String("user", cfg.DBUser),
+		zap.String("schema", cfg.DBSchema),
 	)
 
 	start := time.Now()
@@ -61,8 +63,8 @@ func runLoad(cmd *cobra.Command, args []string) {
 	elapsed := time.Since(start)
 
 	log.Info("Load complete",
-		"duration", elapsed.Round(time.Second),
-		"rows", stats.RowsLoaded,
-		"throughput_rows_s", float64(stats.RowsLoaded)/elapsed.Seconds(),
+		zap.Duration("duration", elapsed.Round(time.Second)),
+		zap.Int64("rows", stats.RowsLoaded),
+		zap.Float64("throughput_rows_s", float64(stats.RowsLoaded)/elapsed.Seconds()),
 	)
 }

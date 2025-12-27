@@ -5,91 +5,101 @@ Build a high-performance OSM to PostgreSQL importer to replace the slow original
 - Target: Process 84GB planet file in under 1 hour
 - Machine: 64GB RAM, 6 cores (12 threads), PostgreSQL in Docker on NVME
 
+## Current Performance
+
+### Netherlands 1.3GB Benchmark
+| Metric | Baseline | Sequential | Pipelined | Improvement |
+|--------|----------|------------|-----------|-------------|
+| Total Time | 13m 12s | 8m 41s | **6m 31s** | **50% faster** |
+| Pass 1 | - | 25s | 25s | Same |
+| Pass 2 + Load | - | 8m 4s | 6m 6s | 24% faster |
+| Index Creation | - | ~1m 30s | 24s | 62% faster |
+| Throughput | ~2.7 MB/s | 6.2 MB/s | 3.3 MB/s | - |
+
+### Breakdown (Pipelined)
+- **Pass 1** (node indexing): 25s for 135M nodes
+- **Pass 2** (geometry building + streaming): 1m 25s for 18M ways, 209K relations
+- **Loading** (overlapped with Pass 2):
+  - Lines: 2.2M rows in 46s
+  - Points: 12M rows in 3m 23s (bottleneck)
+  - Polygons: 11.9M rows in 3m 15s
+- **Index creation**: 24s (GIST + B-tree, parallel)
+
+### Bottleneck Analysis
+PostgreSQL loading is now the primary bottleneck. Extraction completes ~4 minutes before loading finishes.
+The ST_GeomFromWKB conversion runs per-row during INSERT and is CPU-bound on the PostgreSQL side.
+
 ## Architecture
-Two-pass mmap-based approach:
-1. **Pass 1**: Stream nodes into memory-mapped index file (O(1) coordinate lookups)
-2. **Pass 2**: Stream ways/relations, lookup coords from mmap, build WKT geometries, write to Parquet
-3. **Load**: Parallel bulk load Parquet files into PostgreSQL using COPY protocol
+Two-pass mmap-based approach with pipelined streaming:
 
-## Completed Tasks
+1. **Pass 1**: Stream nodes into 80GB memory-mapped index file (O(1) coordinate lookups)
+2. **Pass 2 + Load**: Parallel workers process ways/relations, lookup coords from mmap, build WKB geometries, stream directly to PostgreSQL via channels (no intermediate Parquet files)
 
-### 1. Core Implementation
-- [x] Cobra CLI structure with subcommands (import, extract, transform, load)
-- [x] Mmap-based node index (`internal/nodeindex/mmap.go`)
-- [x] PBF extractor with two-pass geometry building (`internal/pbf/extractor.go`)
-- [x] Parquet writer for geometries (`internal/parquet/`)
-- [x] PostgreSQL loader with COPY protocol (`internal/loader/loader.go`)
+The pipelined architecture starts loading points while ways are still being processed, overlapping extraction and loading phases for faster total import time.
 
-### 2. Performance Optimizations
+## Completed Optimizations
+
+- [x] Mmap-based node index for O(1) coordinate lookups
+- [x] Parallel way/relation processing with worker goroutines
+- [x] WKB (binary) geometry encoding instead of WKT (text)
 - [x] PostgreSQL COPY protocol for bulk loading
-- [x] Parallel table loading (all 3 tables load concurrently)
-- [x] Parallel index creation (GIST and B-tree indexes created in parallel)
-- [x] String building optimization (strings.Builder instead of fmt.Sprintf)
-- [x] PostgreSQL tuning config created at `/home/kevin/services/geoserver/postgresql.conf`
-
-### 3. Logging
-- [x] Added zap structured logging (`internal/logger/logger.go`)
-- [x] Updated all cmd/*.go files to use logger
-- [x] Updated internal/pbf/extractor.go to use logger
-- [x] Updated internal/loader/loader.go to use logger
-- [x] Updated internal/transform/transformer.go to use logger
-
-## Baseline Performance (Netherlands 1.3GB)
-- **Total time**: 13 minutes 12 seconds
-- **Extract**: 5m8s (38.9%) - 135M nodes, 18M ways, 209K relations
-- **Load**: 8m4s (61.1%) - 26M rows loaded
-- **Projected planet time**: ~14 hours (need to get under 1 hour)
-
-## Current State
-
-### Just Completed
-- Zap logging integration across all files
-- Build compiles successfully
-
-### Blocked On
-- PostgreSQL container has permission issue with custom config file
-- Container is running but falling back to default config
-- Need to restart shell with docker group permissions
-
-### PostgreSQL Config Issue
-The custom config at `/home/kevin/services/geoserver/postgresql.conf` has permission denied error.
-Config file permissions are 644 (should be readable), but the postgres container user may not have access.
-
-To fix after shell restart:
-```bash
-# Check container service name
-docker compose -f /home/kevin/services/geoserver/compose.yaml ps
-
-# Restart postgres container
-docker compose -f /home/kevin/services/geoserver/compose.yaml restart <service-name>
-
-# Verify connection
-PGPASSWORD=postgres psql -h localhost -p 5412 -U kevin -d geoserver_db -c "SELECT version();"
-```
+- [x] Parallel table loading (all 3 geometry tables load concurrently)
+- [x] Parallel index creation after data load
+- [x] UNLOGGED tables during load, converted to LOGGED after
+- [x] Fixed log formatting (switched to base zap.Logger with typed fields)
+- [x] **Pipelined extraction and loading** - Extraction streams directly to loaders via channels, no intermediate files
 
 ## Next Steps
 
-### Immediate
-1. Fix PostgreSQL container permissions and restart
-2. Test parallel loading with new zap logging
-3. Measure performance improvement from parallel loading
+### High Priority - PostgreSQL Loading Optimization
+The bottleneck is now PostgreSQL's ST_GeomFromWKB conversion. Options to investigate:
+
+1. **Batch INSERT with unnest()** - Instead of row-by-row INSERT, use array-based batch insertion:
+   ```sql
+   INSERT INTO table SELECT unnest($1::bigint[]), unnest($2::bytea[])...
+   ```
+
+2. **Parallel COPY per table** - Split each table's data into chunks and load with multiple connections
+
+3. **Direct EWKB insertion** - Since WKB already includes SRID, might be able to cast directly:
+   ```sql
+   INSERT INTO table (geom) VALUES ($1::geometry)
+   ```
+   (Requires testing if PostgreSQL accepts raw EWKB as geometry type)
+
+4. **Partitioned loading** - Create multiple temp tables, INSERT in parallel, then combine
 
 ### Future Optimizations
 1. Add multipolygon relation handling (currently skipped)
-2. Consider WKB instead of WKT for geometry transfer
-3. Profile and optimize bottlenecks
-4. Test with larger regions (Germany, Europe, Planet)
+2. Profile memory usage during large imports
+3. Test with larger regions (Germany, Europe, Planet)
 
 ## Key Files
-- `cmd/import.go` - Main import pipeline
-- `internal/pbf/extractor.go` - Two-pass PBF extraction
-- `internal/loader/loader.go` - Parallel PostgreSQL loading
+- `cmd/import.go` - Main import pipeline (uses pipelined architecture)
+- `internal/pipeline/` - Pipelined extraction and loading:
+  - `coordinator.go` - Orchestrates parallel extraction and loading
+  - `streaming_extractor.go` - Streams geometries to channels
+  - `streaming_loader.go` - Loads from channels to PostgreSQL
+  - `types.go` - Shared types (GeometryRecord, stats)
+- `internal/pbf/extractor.go` - Two-pass PBF extraction (for standalone `extract` command)
+- `internal/loader/loader.go` - Parquet-based loading (for standalone `load` command)
 - `internal/nodeindex/mmap.go` - Memory-mapped node coordinate index
+- `internal/wkb/encoder.go` - EWKB geometry encoder with SRID 4326
 - `internal/logger/logger.go` - Zap logging wrapper
-- `/home/kevin/services/geoserver/postgresql.conf` - PostgreSQL tuning
-- `/home/kevin/services/geoserver/compose.yaml` - Docker compose config
 
-## Test Command
+## Test Commands
 ```bash
-./osm2pgsql-go import --drop-existing -v testdata/netherlands.osm.pbf
+# Monaco (quick test, 657KB)
+./osm2pgsql-go import --db-host localhost --db-port 5412 -U kevin -W 'PASSWORD' -d geoserver_db --drop-existing testdata/monaco.osm.pbf
+
+# Netherlands (benchmark, 1.3GB)
+./osm2pgsql-go import --db-host localhost --db-port 5412 -U kevin -W 'PASSWORD' -d geoserver_db --drop-existing testdata/netherlands.osm.pbf
 ```
+
+## PostgreSQL Config
+Custom tuning at `/home/kevin/services/geoserver/postgresql.conf`:
+- shared_buffers: 8GB
+- work_mem: 512MB
+- maintenance_work_mem: 4GB
+- max_wal_size: 10GB
+- checkpoint_completion_target: 0.9

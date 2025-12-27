@@ -10,6 +10,8 @@ import (
 	"github.com/apache/arrow/go/v14/arrow/array"
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/apache/arrow/go/v14/parquet/pqarrow"
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 
@@ -103,7 +105,7 @@ func (l *Loader) Run() (*Stats, error) {
 
 		// Check if source file exists
 		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
-			log.Debug("Skipping table (no source file)", "table", table.name)
+			log.Debug("Skipping table (no source file)", zap.String("table", table.name))
 			continue
 		}
 
@@ -111,7 +113,7 @@ func (l *Loader) Run() (*Stats, error) {
 		tablesToIndex = append(tablesToIndex, fullTableName)
 
 		go func(tableName, fullName, source string) {
-			log.Info("Loading table", "table", tableName)
+			log.Info("Loading table", zap.String("table", tableName))
 			count, err := l.loadTableData(ctx, fullName, source)
 			resultChan <- loadResult{tableName: tableName, count: count, err: err}
 		}(table.name, fullTableName, sourcePath)
@@ -124,12 +126,12 @@ func (l *Loader) Run() (*Stats, error) {
 			return nil, fmt.Errorf("failed to load %s: %w", result.tableName, result.err)
 		}
 		stats.RowsLoaded += result.count
-		log.Info("Table loaded", "table", result.tableName, "rows", result.count)
+		log.Info("Table loaded", zap.String("table", result.tableName), zap.Int64("rows", result.count))
 	}
 
 	// Phase 2: Create all indexes in parallel
 	if l.createIndexes && len(tablesToIndex) > 0 {
-		log.Info("Creating indexes in parallel", "tables", len(tablesToIndex))
+		log.Info("Creating indexes in parallel", zap.Int("tables", len(tablesToIndex)))
 		errChan := make(chan error, len(tablesToIndex)*2) // 2 indexes per table
 
 		for _, tableName := range tablesToIndex {

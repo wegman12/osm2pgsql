@@ -3,6 +3,8 @@ package cmd
 import (
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	"github.com/kevinramage/osm2pgsql-go/internal/pbf"
 	"github.com/spf13/cobra"
@@ -43,9 +45,9 @@ func runExtract(cmd *cobra.Command, args []string) {
 	}
 
 	log.Info("Starting PBF extraction",
-		"input", cfg.InputFile,
-		"output", cfg.OutputDir,
-		"workers", cfg.Workers,
+		zap.String("input", cfg.InputFile),
+		zap.String("output", cfg.OutputDir),
+		zap.Int("workers", cfg.Workers),
 	)
 
 	start := time.Now()
@@ -64,10 +66,10 @@ func runExtract(cmd *cobra.Command, args []string) {
 	elapsed := time.Since(start)
 
 	log.Info("Extraction complete",
-		"duration", elapsed.Round(time.Second),
-		"nodes", stats.Nodes,
-		"ways", stats.Ways,
-		"relations", stats.Relations,
-		"throughput_mb_s", float64(stats.BytesRead)/(1024*1024)/elapsed.Seconds(),
+		zap.Duration("duration", elapsed.Round(time.Second)),
+		zap.Int64("nodes", stats.Nodes),
+		zap.Int64("ways", stats.Ways),
+		zap.Int64("relations", stats.Relations),
+		zap.Float64("throughput_mb_s", float64(stats.BytesRead)/(1024*1024)/elapsed.Seconds()),
 	)
 }

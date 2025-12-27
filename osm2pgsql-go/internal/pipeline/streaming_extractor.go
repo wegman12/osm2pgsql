@@ -1,9 +1,8 @@
-package pbf
+package pipeline
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,48 +16,45 @@ import (
 	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	"github.com/kevinramage/osm2pgsql-go/internal/nodeindex"
-	"github.com/kevinramage/osm2pgsql-go/internal/parquet"
 	"github.com/kevinramage/osm2pgsql-go/internal/wkb"
 	"github.com/paulmach/osm"
 	"github.com/paulmach/osm/osmpbf"
 )
 
-// Stats holds extraction statistics
-type Stats struct {
-	Nodes     int64
-	Ways      int64
-	Relations int64
-	BytesRead int64
-}
-
-// Extractor reads PBF files and writes to Parquet with geometries
-type Extractor struct {
-	cfg *config.Config
+// StreamingExtractor reads PBF files and streams geometries to channels
+type StreamingExtractor struct {
+	cfg           *config.Config
+	channelBuffer int
 
 	// Node index for coordinate lookups
 	nodeIndex     *nodeindex.MmapIndex
 	nodeIndexPath string
 
-	stats Stats
+	stats ExtractStats
 }
 
-// NewExtractor creates a new PBF extractor
-func NewExtractor(cfg *config.Config) (*Extractor, error) {
-	// Create output directory
+// NewStreamingExtractor creates a new streaming PBF extractor
+func NewStreamingExtractor(cfg *config.Config, channelBuffer int) (*StreamingExtractor, error) {
+	// Create output directory for node index
 	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create output directory: %w", err)
+		return nil, err
 	}
 
 	nodeIndexPath := filepath.Join(cfg.OutputDir, "node_index.bin")
 
-	return &Extractor{
+	if channelBuffer <= 0 {
+		channelBuffer = 50000
+	}
+
+	return &StreamingExtractor{
 		cfg:           cfg,
+		channelBuffer: channelBuffer,
 		nodeIndexPath: nodeIndexPath,
 	}, nil
 }
 
 // Close cleans up resources
-func (e *Extractor) Close() error {
+func (e *StreamingExtractor) Close() error {
 	if e.nodeIndex != nil {
 		e.nodeIndex.Close()
 		e.nodeIndex = nil
@@ -68,28 +64,36 @@ func (e *Extractor) Close() error {
 	return nil
 }
 
-// Run executes the two-pass extraction
-func (e *Extractor) Run() (*Stats, error) {
+// Stats returns extraction statistics
+func (e *StreamingExtractor) Stats() *ExtractStats {
+	return &e.stats
+}
+
+// Run executes the two-pass extraction and returns geometry streams
+// Pass 1 runs synchronously (node indexing must complete first)
+// Pass 2 runs in the background, streaming results to the returned channels
+func (e *StreamingExtractor) Run(ctx context.Context) (*GeometryStreams, error) {
 	log := logger.Get()
 
 	f, err := os.Open(e.cfg.InputFile)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
 	// Get file size for progress reporting
 	fileInfo, err := f.Stat()
 	if err != nil {
+		f.Close()
 		return nil, err
 	}
 	e.stats.BytesRead = fileInfo.Size()
 
-	// Pass 1: Build node index (parallelized)
+	// Pass 1: Build node index (must complete before Pass 2)
 	log.Info("Pass 1: Building node coordinate index")
 	start := time.Now()
-	nodeCount, err := e.buildNodeIndexParallel(f)
+	nodeCount, err := e.buildNodeIndex(ctx, f)
 	if err != nil {
+		f.Close()
 		return nil, err
 	}
 	e.stats.Nodes = nodeCount
@@ -97,31 +101,26 @@ func (e *Extractor) Run() (*Stats, error) {
 
 	// Seek back to beginning for pass 2
 	if _, err := f.Seek(0, 0); err != nil {
+		f.Close()
 		return nil, err
 	}
 
 	// Reopen node index for reading
 	e.nodeIndex, err = nodeindex.OpenMmapIndex(e.nodeIndexPath)
 	if err != nil {
+		f.Close()
 		return nil, err
 	}
 
-	// Pass 2: Process ways and relations, building geometries (parallelized)
-	log.Info("Pass 2: Building geometries (parallel with WKB)")
-	start = time.Now()
-	wayCount, relCount, err := e.buildGeometriesParallel(f)
-	if err != nil {
-		return nil, err
-	}
-	e.stats.Ways = wayCount
-	e.stats.Relations = relCount
-	log.Info("Pass 2 complete", zap.Int64("ways", wayCount), zap.Int64("relations", relCount), zap.Duration("duration", time.Since(start).Round(time.Second)))
+	// Pass 2: Stream geometries to channels (runs in background)
+	log.Info("Pass 2: Building geometries (streaming to loaders)")
+	streams := e.buildGeometriesStreaming(ctx, f)
 
-	return &e.stats, nil
+	return streams, nil
 }
 
-// buildNodeIndexParallel performs pass 1 with parallel processing
-func (e *Extractor) buildNodeIndexParallel(f *os.File) (int64, error) {
+// buildNodeIndex performs pass 1: indexing all node coordinates
+func (e *StreamingExtractor) buildNodeIndex(ctx context.Context, f *os.File) (int64, error) {
 	log := logger.Get()
 
 	// Create mmap index
@@ -131,20 +130,20 @@ func (e *Extractor) buildNodeIndexParallel(f *os.File) (int64, error) {
 	}
 	defer idx.Close()
 
-	scanner := osmpbf.New(context.Background(), f, runtime.NumCPU())
+	scanner := osmpbf.New(ctx, f, runtime.NumCPU())
 	defer scanner.Close()
 
 	var count atomic.Int64
 
 	// Progress ticker
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	tickerCtx, cancelTicker := context.WithCancel(ctx)
+	defer cancelTicker()
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-tickerCtx.Done():
 				return
 			case <-ticker.C:
 				log.Debug("Node indexing progress", zap.Int64("nodes", count.Load()))
@@ -152,8 +151,6 @@ func (e *Extractor) buildNodeIndexParallel(f *os.File) (int64, error) {
 		}
 	}()
 
-	// The osmpbf scanner already decodes in parallel
-	// Mmap writes are thread-safe for unique node IDs (each writes to unique offset)
 	for scanner.Scan() {
 		obj := scanner.Object()
 		switch n := obj.(type) {
@@ -173,42 +170,39 @@ func (e *Extractor) buildNodeIndexParallel(f *os.File) (int64, error) {
 	return count.Load(), nil
 }
 
-// geometryResult holds the result of processing a single way
-type geometryResult struct {
-	osmID    int64
-	osmType  string
-	tags     string
-	geomWKB  []byte
-	geomType int // 0=point, 1=line, 2=polygon
-}
-
-// buildGeometriesParallel performs pass 2 with parallel worker goroutines
-func (e *Extractor) buildGeometriesParallel(f *os.File) (int64, int64, error) {
+// buildGeometriesStreaming performs pass 2: streaming geometries to channels
+func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os.File) *GeometryStreams {
 	log := logger.Get()
 	numWorkers := e.cfg.Workers
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
 
-	// Channels for work distribution
+	// Output channels with configurable buffer
+	pointsChan := make(chan GeometryRecord, e.channelBuffer)
+	linesChan := make(chan GeometryRecord, e.channelBuffer)
+	polygonsChan := make(chan GeometryRecord, e.channelBuffer)
+	errChan := make(chan error, 1)
+
+	// Internal work distribution channels
 	nodeChan := make(chan *osm.Node, 10000)
 	wayChan := make(chan *osm.Way, 10000)
 	resultChan := make(chan geometryResult, 10000)
 
-	var nodeCount, wayCount, relCount atomic.Int64
+	var wayCount, relCount atomic.Int64
 	var wg sync.WaitGroup
 
 	// Start worker goroutines for processing ways
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func() {
 			defer wg.Done()
 			encoder := wkb.NewEncoder(1024)
-			coords := make([]float64, 0, 2000) // Pre-allocated coordinate buffer
+			coords := make([]float64, 0, 2000)
 
 			for way := range wayChan {
 				wayCount.Add(1)
-				coords = coords[:0] // Reset without reallocating
+				coords = coords[:0]
 
 				// Build coordinate array from node references
 				valid := true
@@ -221,7 +215,7 @@ func (e *Extractor) buildGeometriesParallel(f *os.File) (int64, int64, error) {
 					coords = append(coords, lon, lat)
 				}
 
-				if !valid || len(coords) < 4 { // Need at least 2 points
+				if !valid || len(coords) < 4 {
 					continue
 				}
 
@@ -229,17 +223,15 @@ func (e *Extractor) buildGeometriesParallel(f *os.File) (int64, int64, error) {
 				isClosed := len(way.Nodes) >= 4 && way.Nodes[0].ID == way.Nodes[len(way.Nodes)-1].ID
 
 				if isClosed && isArea(way.Tags) {
-					// Polygon
 					wkbBytes := encoder.EncodePolygon(coords)
 					resultChan <- geometryResult{
 						osmID:    int64(way.ID),
 						osmType:  "W",
 						tags:     tags,
-						geomWKB:  append([]byte(nil), wkbBytes...), // Copy to avoid reuse issues
+						geomWKB:  append([]byte(nil), wkbBytes...),
 						geomType: 2,
 					}
 				} else {
-					// LineString
 					wkbBytes := encoder.EncodeLineString(coords)
 					resultChan <- geometryResult{
 						osmID:    int64(way.ID),
@@ -250,7 +242,7 @@ func (e *Extractor) buildGeometriesParallel(f *os.File) (int64, int64, error) {
 					}
 				}
 			}
-		}(i)
+		}()
 	}
 
 	// Start worker for processing nodes (points)
@@ -260,7 +252,6 @@ func (e *Extractor) buildGeometriesParallel(f *os.File) (int64, int64, error) {
 		encoder := wkb.NewEncoder(64)
 
 		for node := range nodeChan {
-			nodeCount.Add(1)
 			if len(node.Tags) > 0 && hasMeaningfulTags(node.Tags) {
 				wkbBytes := encoder.EncodePoint(node.Lon, node.Lat)
 				resultChan <- geometryResult{
@@ -274,103 +265,132 @@ func (e *Extractor) buildGeometriesParallel(f *os.File) (int64, int64, error) {
 		}
 	}()
 
-	// Start result writer goroutine
-	var writerErr error
-	var writerWg sync.WaitGroup
-	writerWg.Add(1)
+	// Start router goroutine: routes results to typed output channels
 	go func() {
-		defer writerWg.Done()
-
-		pointWriter, err := parquet.NewWKBGeometryWriter(filepath.Join(e.cfg.OutputDir, "points.parquet"), e.cfg.BatchSize)
-		if err != nil {
-			writerErr = err
-			return
-		}
-		defer pointWriter.Close()
-
-		lineWriter, err := parquet.NewWKBGeometryWriter(filepath.Join(e.cfg.OutputDir, "lines.parquet"), e.cfg.BatchSize)
-		if err != nil {
-			writerErr = err
-			return
-		}
-		defer lineWriter.Close()
-
-		polygonWriter, err := parquet.NewWKBGeometryWriter(filepath.Join(e.cfg.OutputDir, "polygons.parquet"), e.cfg.BatchSize)
-		if err != nil {
-			writerErr = err
-			return
-		}
-		defer polygonWriter.Close()
+		defer close(pointsChan)
+		defer close(linesChan)
+		defer close(polygonsChan)
 
 		for result := range resultChan {
+			record := GeometryRecord{
+				OsmID:   result.osmID,
+				OsmType: result.osmType,
+				Tags:    result.tags,
+				GeomWKB: result.geomWKB,
+			}
 			switch result.geomType {
 			case 0:
-				pointWriter.Write(result.osmID, result.osmType, result.tags, result.geomWKB)
+				select {
+				case pointsChan <- record:
+				case <-ctx.Done():
+					return
+				}
 			case 1:
-				lineWriter.Write(result.osmID, result.osmType, result.tags, result.geomWKB)
+				select {
+				case linesChan <- record:
+				case <-ctx.Done():
+					return
+				}
 			case 2:
-				polygonWriter.Write(result.osmID, result.osmType, result.tags, result.geomWKB)
+				select {
+				case polygonsChan <- record:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
 
 	// Progress ticker
-	ctx, cancel := context.WithCancel(context.Background())
+	tickerCtx, cancelTicker := context.WithCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-tickerCtx.Done():
 				return
 			case <-ticker.C:
 				log.Debug("Geometry building progress",
-					zap.Int64("nodes", nodeCount.Load()),
 					zap.Int64("ways", wayCount.Load()),
 					zap.Int64("relations", relCount.Load()))
 			}
 		}
 	}()
 
-	// Read PBF and distribute work
-	scanner := osmpbf.New(context.Background(), f, runtime.NumCPU())
-	defer scanner.Close()
+	// Start PBF scanner goroutine
+	go func() {
+		defer f.Close()
+		defer cancelTicker()
+		defer close(errChan) // Always close error channel when done
 
-	for scanner.Scan() {
-		obj := scanner.Object()
-		switch o := obj.(type) {
-		case *osm.Node:
-			nodeChan <- o
-		case *osm.Way:
-			wayChan <- o
-		case *osm.Relation:
-			relCount.Add(1)
-			// TODO: Handle multipolygon relations
+		scanner := osmpbf.New(ctx, f, runtime.NumCPU())
+		defer scanner.Close()
+
+		for scanner.Scan() {
+			obj := scanner.Object()
+			switch o := obj.(type) {
+			case *osm.Node:
+				select {
+				case nodeChan <- o:
+				case <-ctx.Done():
+					close(nodeChan)
+					close(wayChan)
+					return
+				}
+			case *osm.Way:
+				select {
+				case wayChan <- o:
+				case <-ctx.Done():
+					close(nodeChan)
+					close(wayChan)
+					return
+				}
+			case *osm.Relation:
+				relCount.Add(1)
+				// TODO: Handle multipolygon relations
+			}
 		}
-	}
 
-	if err := scanner.Err(); err != nil && err != io.EOF {
+		if err := scanner.Err(); err != nil && err != io.EOF {
+			select {
+			case errChan <- err:
+			default:
+			}
+		}
+
+		// Close input channels and wait for workers
 		close(nodeChan)
 		close(wayChan)
-		cancel()
-		return 0, 0, err
+		wg.Wait()
+
+		// Close result channel (triggers router goroutine to close output channels)
+		close(resultChan)
+
+		// Update stats
+		e.stats.Ways = wayCount.Load()
+		e.stats.Relations = relCount.Load()
+
+		log.Info("Pass 2 complete",
+			zap.Int64("ways", wayCount.Load()),
+			zap.Int64("relations", relCount.Load()))
+	}()
+
+	return &GeometryStreams{
+		Points:   pointsChan,
+		Lines:    linesChan,
+		Polygons: polygonsChan,
+		Errors:   errChan,
 	}
+}
 
-	// Close input channels and wait for workers
-	close(nodeChan)
-	close(wayChan)
-	wg.Wait()
-
-	// Close result channel and wait for writer
-	close(resultChan)
-	writerWg.Wait()
-	cancel()
-
-	if writerErr != nil {
-		return 0, 0, writerErr
-	}
-
-	return wayCount.Load(), relCount.Load(), nil
+// geometryResult holds the result of processing a single geometry (internal)
+type geometryResult struct {
+	osmID    int64
+	osmType  string
+	tags     string
+	geomWKB  []byte
+	geomType int // 0=point, 1=line, 2=polygon
 }
 
 // hasMeaningfulTags checks if tags contain more than just metadata
@@ -406,14 +426,12 @@ func tagsToJSON(tags osm.Tags) string {
 
 // isArea checks if a closed way should be treated as a polygon
 func isArea(tags osm.Tags) bool {
-	// Explicit area tag
 	for _, tag := range tags {
 		if tag.Key == "area" {
 			return tag.Value == "yes"
 		}
 	}
 
-	// Tags that imply area
 	areaKeys := map[string]bool{
 		"building":    true,
 		"landuse":     true,
@@ -423,8 +441,8 @@ func isArea(tags osm.Tags) bool {
 		"shop":        true,
 		"tourism":     true,
 		"man_made":    true,
-		"waterway":    false, // rivers are lines even if closed
-		"highway":     false, // roundabouts are lines
+		"waterway":    false,
+		"highway":     false,
 		"barrier":     false,
 		"railway":     false,
 	}

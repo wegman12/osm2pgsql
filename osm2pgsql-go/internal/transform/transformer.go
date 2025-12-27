@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	_ "github.com/marcboeker/go-duckdb"
@@ -92,7 +94,7 @@ func (t *Transformer) Run() (*Stats, error) {
 		return nil, fmt.Errorf("failed to build points: %w", err)
 	}
 	stats.Points = points
-	log.Info("Created points", "count", points)
+	log.Info("Created points", zap.Int64("count", points))
 
 	// Build line geometries (from ways)
 	log.Info("Building line geometries")
@@ -101,7 +103,7 @@ func (t *Transformer) Run() (*Stats, error) {
 		return nil, fmt.Errorf("failed to build lines: %w", err)
 	}
 	stats.Lines = lines
-	log.Info("Created lines", "count", lines)
+	log.Info("Created lines", zap.Int64("count", lines))
 
 	// Build polygon geometries (from closed ways and relations)
 	log.Info("Building polygon geometries")
@@ -110,7 +112,7 @@ func (t *Transformer) Run() (*Stats, error) {
 		return nil, fmt.Errorf("failed to build polygons: %w", err)
 	}
 	stats.Polygons = polygons
-	log.Info("Created polygons", "count", polygons)
+	log.Info("Created polygons", zap.Int64("count", polygons))
 
 	return stats, nil
 }

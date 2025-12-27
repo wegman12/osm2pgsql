@@ -1,31 +1,31 @@
 package cmd
 
 import (
+	"context"
 	"time"
 
-	"github.com/kevinramage/osm2pgsql-go/internal/loader"
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
-	"github.com/kevinramage/osm2pgsql-go/internal/pbf"
+	"github.com/kevinramage/osm2pgsql-go/internal/pipeline"
 	"github.com/spf13/cobra"
 )
 
 var (
-	keepIntermediate bool
+	channelBuffer int
 )
 
 var importCmd = &cobra.Command{
 	Use:   "import <input.osm.pbf>",
 	Short: "Run full import pipeline (extract → load)",
-	Long: `Run the complete OSM import pipeline:
+	Long: `Run the complete OSM import pipeline with pipelined extraction and loading:
 
-  1. Extract: Parse PBF file, build geometries using mmap node index
-  2. Load: Bulk load geometries into PostgreSQL
+  1. Pass 1: Stream nodes into memory-mapped index (O(1) lookup)
+  2. Pass 2: Stream ways/relations, build geometries, load directly to PostgreSQL
 
-The new architecture uses a two-pass approach:
-  - Pass 1: Stream nodes into memory-mapped index (O(1) lookup)
-  - Pass 2: Stream ways, lookup coords from mmap, build geometries
-
-This eliminates the expensive DuckDB join and provides 10-100x speedup.`,
+The pipelined architecture starts loading points while ways are still being
+processed, significantly reducing total import time compared to sequential
+extraction and loading.`,
 	Args: cobra.ExactArgs(1),
 	Run:  runImport,
 }
@@ -33,10 +33,9 @@ This eliminates the expensive DuckDB join and provides 10-100x speedup.`,
 func init() {
 	rootCmd.AddCommand(importCmd)
 
-	importCmd.Flags().IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "Rows per Parquet row group")
 	importCmd.Flags().BoolVar(&createIndexes, "create-indexes", true, "Create spatial indexes after loading")
 	importCmd.Flags().BoolVar(&dropExisting, "drop-existing", false, "Drop existing tables before loading")
-	importCmd.Flags().BoolVar(&keepIntermediate, "keep-intermediate", false, "Keep intermediate Parquet files")
+	importCmd.Flags().IntVar(&channelBuffer, "channel-buffer", 50000, "Buffer size for geometry channels")
 }
 
 func runImport(cmd *cobra.Command, args []string) {
@@ -49,68 +48,45 @@ func runImport(cmd *cobra.Command, args []string) {
 
 	totalStart := time.Now()
 
-	log.Info("Starting osm2pgsql-go import",
-		"input", cfg.InputFile,
-		"output", cfg.DBHost+":"+string(rune(cfg.DBPort))+"/"+cfg.DBName,
-		"workers", cfg.Workers,
+	log.Info("Starting osm2pgsql-go pipelined import",
+		zap.String("input", cfg.InputFile),
+		zap.String("output", cfg.DBHost+":"+string(rune(cfg.DBPort))+"/"+cfg.DBName),
+		zap.Int("workers", cfg.Workers),
+		zap.Int("channel_buffer", channelBuffer),
 	)
 
-	// Stage 1: Extract (two-pass with mmap)
-	log.Info("Stage 1: Extract (two-pass with mmap node index)")
-
-	extractStart := time.Now()
-
-	extractor, err := pbf.NewExtractor(cfg)
-	if err != nil {
-		exitWithError("failed to create extractor", err)
+	// Create pipeline coordinator
+	pipeCfg := pipeline.CoordinatorConfig{
+		ChannelBuffer: channelBuffer,
+		DropExisting:  dropExisting,
+		CreateIndexes: createIndexes,
 	}
 
-	extractStats, err := extractor.Run()
-	extractor.Close()
+	coordinator, err := pipeline.NewCoordinator(cfg, pipeCfg)
 	if err != nil {
-		exitWithError("extraction failed", err)
+		exitWithError("failed to create pipeline", err)
 	}
+	defer coordinator.Close()
 
-	extractElapsed := time.Since(extractStart)
-	log.Info("Extraction complete",
-		"nodes", extractStats.Nodes,
-		"ways", extractStats.Ways,
-		"relations", extractStats.Relations,
-		"duration", extractElapsed.Round(time.Second),
-		"throughput_mb_s", float64(extractStats.BytesRead)/(1024*1024)/extractElapsed.Seconds(),
-	)
-
-	// Stage 2: Load
-	log.Info("Stage 2: Load (PostgreSQL bulk insert)")
-
-	loadStart := time.Now()
-
-	ldr, err := loader.NewLoader(cfg, dropExisting, createIndexes)
+	// Run pipelined import
+	ctx := context.Background()
+	stats, err := coordinator.Run(ctx)
 	if err != nil {
-		exitWithError("failed to create loader", err)
+		exitWithError("import failed", err)
 	}
-
-	loadStats, err := ldr.Run()
-	ldr.Close()
-	if err != nil {
-		exitWithError("load failed", err)
-	}
-
-	loadElapsed := time.Since(loadStart)
-	log.Info("Load complete",
-		"rows", loadStats.RowsLoaded,
-		"duration", loadElapsed.Round(time.Second),
-	)
 
 	// Summary
 	totalElapsed := time.Since(totalStart)
 
 	log.Info("Import complete",
-		"total_time", totalElapsed.Round(time.Second),
-		"extract_time", extractElapsed.Round(time.Second),
-		"extract_pct", 100*extractElapsed.Seconds()/totalElapsed.Seconds(),
-		"load_time", loadElapsed.Round(time.Second),
-		"load_pct", 100*loadElapsed.Seconds()/totalElapsed.Seconds(),
-		"throughput_mb_s", float64(extractStats.BytesRead)/(1024*1024)/totalElapsed.Seconds(),
+		zap.Duration("total_time", totalElapsed.Round(time.Second)),
+		zap.Int64("nodes", stats.Extract.Nodes),
+		zap.Int64("ways", stats.Extract.Ways),
+		zap.Int64("relations", stats.Extract.Relations),
+		zap.Int64("points", stats.PointsLoad.RowsLoaded),
+		zap.Int64("lines", stats.LinesLoad.RowsLoaded),
+		zap.Int64("polygons", stats.PolysLoad.RowsLoaded),
+		zap.Int64("total_rows", stats.TotalRows),
+		zap.Float64("throughput_mb_s", float64(stats.Extract.BytesRead)/(1024*1024)/totalElapsed.Seconds()),
 	)
 }

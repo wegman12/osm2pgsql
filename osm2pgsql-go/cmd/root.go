@@ -3,6 +3,8 @@ package cmd
 import (
 	"os"
 
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	"github.com/spf13/cobra"
@@ -52,10 +54,11 @@ func init() {
 }
 
 func exitWithError(msg string, err error) {
+	log := logger.Get()
 	if err != nil {
-		logger.Error(msg, "error", err)
+		log.Error(msg, zap.Error(err))
 	} else {
-		logger.Error(msg)
+		log.Error(msg)
 	}
 	os.Exit(1)
 }

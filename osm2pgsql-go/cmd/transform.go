@@ -3,6 +3,8 @@ package cmd
 import (
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	"github.com/kevinramage/osm2pgsql-go/internal/transform"
 	"github.com/spf13/cobra"
@@ -32,9 +34,9 @@ func init() {
 func runTransform(cmd *cobra.Command, args []string) {
 	log := logger.Get()
 	log.Info("Starting geometry transformation",
-		"input_dir", cfg.OutputDir,
-		"memory_mb", cfg.MemoryMB,
-		"workers", cfg.Workers,
+		zap.String("input_dir", cfg.OutputDir),
+		zap.Int("memory_mb", cfg.MemoryMB),
+		zap.Int("workers", cfg.Workers),
 	)
 
 	start := time.Now()
@@ -53,9 +55,9 @@ func runTransform(cmd *cobra.Command, args []string) {
 	elapsed := time.Since(start)
 
 	log.Info("Transformation complete",
-		"duration", elapsed.Round(time.Second),
-		"points", stats.Points,
-		"lines", stats.Lines,
-		"polygons", stats.Polygons,
+		zap.Duration("duration", elapsed.Round(time.Second)),
+		zap.Int64("points", stats.Points),
+		zap.Int64("lines", stats.Lines),
+		zap.Int64("polygons", stats.Polygons),
 	)
 }
