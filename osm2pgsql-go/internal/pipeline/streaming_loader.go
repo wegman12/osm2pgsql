@@ -116,8 +116,9 @@ func (l *StreamingLoader) LoadStream(ctx context.Context, tableName string, reco
 
 	log.Info("Starting stream load", zap.String("table", tableName))
 
-	// Use COPY protocol for bulk loading via temp table
-	count, err := l.copyFromChannel(ctx, conn.Conn(), fullTableName, records)
+	// Use COPY protocol for bulk loading directly to final table
+	// PostGIS accepts raw EWKB bytes for geometry columns
+	count, err := l.copyFromChannel(ctx, conn.Conn(), l.cfg.DBSchema, tableName, records)
 	if err != nil {
 		return 0, err
 	}
@@ -131,34 +132,14 @@ func (l *StreamingLoader) LoadStream(ctx context.Context, tableName string, reco
 	return count, nil
 }
 
-// copyFromChannel uses PostgreSQL COPY to bulk load from a channel
-func (l *StreamingLoader) copyFromChannel(ctx context.Context, conn *pgx.Conn, tableName string, records <-chan GeometryRecord) (int64, error) {
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Create temporary table for COPY
-	tempTable := "osm_stream_tmp"
-	tempTableSQL := fmt.Sprintf(`
-		DROP TABLE IF EXISTS %s;
-		CREATE TEMP TABLE %s (
-			osm_id BIGINT,
-			osm_type CHAR(1),
-			tags TEXT,
-			geom_wkb BYTEA
-		) ON COMMIT DROP
-	`, tempTable, tempTable)
-
-	if _, err := tx.Exec(ctx, tempTableSQL); err != nil {
-		return 0, fmt.Errorf("failed to create temp table: %w", err)
-	}
-
+// copyFromChannel uses PostgreSQL COPY to bulk load directly from a channel
+// PostGIS accepts raw EWKB bytes directly into geometry columns via COPY
+func (l *StreamingLoader) copyFromChannel(ctx context.Context, conn *pgx.Conn, schema, tableName string, records <-chan GeometryRecord) (int64, error) {
 	// Create channel-based row source
 	rowChan := make(chan []interface{}, 10000)
 
 	// Goroutine to convert GeometryRecords to row slices
+	// Note: Tags are JSON strings, GeomWKB is raw EWKB bytes that PostGIS accepts directly
 	go func() {
 		defer close(rowChan)
 		for record := range records {
@@ -170,35 +151,15 @@ func (l *StreamingLoader) copyFromChannel(ctx context.Context, conn *pgx.Conn, t
 		}
 	}()
 
-	// COPY data into temp table
-	copyCount, err := tx.CopyFrom(
+	// COPY directly to final table - PostGIS accepts EWKB bytes for geometry columns
+	copyCount, err := conn.CopyFrom(
 		ctx,
-		pgx.Identifier{tempTable},
-		[]string{"osm_id", "osm_type", "tags", "geom_wkb"},
+		pgx.Identifier{schema, tableName},
+		[]string{"osm_id", "osm_type", "tags", "geom"},
 		&rowSource{rows: rowChan},
 	)
 	if err != nil {
 		return 0, fmt.Errorf("COPY failed: %w", err)
-	}
-
-	// Insert from temp table to final table with geometry conversion
-	insertSQL := fmt.Sprintf(`
-		INSERT INTO %s (osm_id, osm_type, tags, geom)
-		SELECT
-			osm_id,
-			osm_type,
-			tags::jsonb,
-			ST_GeomFromWKB(geom_wkb)
-		FROM %s
-		WHERE geom_wkb IS NOT NULL
-	`, tableName, tempTable)
-
-	if _, err := tx.Exec(ctx, insertSQL); err != nil {
-		return 0, fmt.Errorf("failed to insert from temp table: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("failed to commit: %w", err)
 	}
 
 	return copyCount, nil
