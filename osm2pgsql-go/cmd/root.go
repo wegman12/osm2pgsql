@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"os"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -11,8 +12,10 @@ import (
 )
 
 var (
-	cfg     = config.DefaultConfig()
-	verbose bool
+	cfg             = config.DefaultConfig()
+	verbose         bool
+	logFile         string
+	metricsInterval time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -30,7 +33,15 @@ The import process has three stages:
 You can run all stages with 'import' or run them individually.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		cfg.Verbose = verbose
-		logger.Init(verbose)
+		cfg.LogFile = logFile
+		cfg.MetricsInterval = metricsInterval
+
+		// Initialize logger with optional file output
+		if logFile != "" {
+			logger.InitWithFile(verbose, logFile)
+		} else {
+			logger.Init(verbose)
+		}
 	},
 }
 
@@ -43,6 +54,10 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().StringVarP(&cfg.OutputDir, "output-dir", "o", cfg.OutputDir, "Directory for intermediate Parquet files")
 	rootCmd.PersistentFlags().IntVarP(&cfg.Workers, "workers", "j", cfg.Workers, "Number of parallel workers")
+
+	// Logging and metrics flags
+	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", "", "Path to log file for persistent logging (JSON format)")
+	rootCmd.PersistentFlags().DurationVar(&metricsInterval, "metrics-interval", 30*time.Second, "Interval for system metrics logging (e.g., 10s, 1m)")
 
 	// Database flags (persistent so they're available to all subcommands)
 	rootCmd.PersistentFlags().StringVar(&cfg.DBHost, "db-host", cfg.DBHost, "PostgreSQL host")

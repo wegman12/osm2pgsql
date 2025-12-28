@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"unsafe"
 )
 
 const (
@@ -132,8 +133,15 @@ func (m *MmapIndex) Get(nodeID int64) (lat, lon float64, ok bool) {
 
 // Sync flushes changes to disk
 func (m *MmapIndex) Sync() error {
-	// On Linux with MAP_SHARED, the OS handles syncing automatically
-	// We rely on munmap and file close to ensure data is written
+	// Force msync to ensure data is persisted to disk
+	// This is especially important for large sparse files
+	_, _, errno := syscall.Syscall(syscall.SYS_MSYNC,
+		uintptr(unsafe.Pointer(&m.data[0])),
+		uintptr(len(m.data)),
+		uintptr(syscall.MS_SYNC))
+	if errno != 0 {
+		return errno
+	}
 	return nil
 }
 

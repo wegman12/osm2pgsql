@@ -147,7 +147,7 @@ func (e *Extractor) buildNodeIndexParallel(f *os.File) (int64, error) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				log.Debug("Node indexing progress", zap.Int64("nodes", count.Load()))
+				log.Debug("[extractor.go] Node indexing progress", zap.Int64("nodes", count.Load()))
 			}
 		}
 	}()
@@ -415,18 +415,18 @@ func isArea(tags osm.Tags) bool {
 
 	// Tags that imply area
 	areaKeys := map[string]bool{
-		"building":    true,
-		"landuse":     true,
-		"natural":     true,
-		"leisure":     true,
-		"amenity":     true,
-		"shop":        true,
-		"tourism":     true,
-		"man_made":    true,
-		"waterway":    false, // rivers are lines even if closed
-		"highway":     false, // roundabouts are lines
-		"barrier":     false,
-		"railway":     false,
+		"building": true,
+		"landuse":  true,
+		"natural":  true,
+		"leisure":  true,
+		"amenity":  true,
+		"shop":     true,
+		"tourism":  true,
+		"man_made": true,
+		"waterway": false, // rivers are lines even if closed
+		"highway":  false, // roundabouts are lines
+		"barrier":  false,
+		"railway":  false,
 	}
 
 	for _, tag := range tags {

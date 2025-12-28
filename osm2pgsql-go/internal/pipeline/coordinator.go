@@ -10,6 +10,7 @@ import (
 
 	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
+	"github.com/kevinramage/osm2pgsql-go/internal/metrics"
 )
 
 // CoordinatorConfig holds pipeline-specific configuration
@@ -76,6 +77,17 @@ func (c *Coordinator) Run(ctx context.Context) (*ImportStats, error) {
 	log := logger.Get()
 	stats := &ImportStats{}
 
+	// Start metrics collection in background if interval is set
+	if c.cfg.MetricsInterval > 0 {
+		metricsCtx, cancelMetrics := context.WithCancel(ctx)
+		defer cancelMetrics()
+
+		collector := metrics.NewCollector(c.cfg.MetricsInterval, log)
+		go collector.Start(metricsCtx)
+		log.Info("System metrics collection started",
+			zap.Duration("interval", c.cfg.MetricsInterval))
+	}
+
 	// Ensure PostGIS and schema exist
 	if err := c.loader.EnsureSchema(ctx); err != nil {
 		return nil, err
@@ -95,6 +107,14 @@ func (c *Coordinator) Run(ctx context.Context) (*ImportStats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("extraction failed: %w", err)
 	}
+
+	// Reset live stats start time
+	c.loader.liveStats.StartTime = time.Now()
+
+	// Start live progress reporter
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	defer cancelProgress()
+	go c.reportLiveProgress(progressCtx)
 
 	// Create errgroup for concurrent loading
 	g, gctx := errgroup.WithContext(ctx)
@@ -190,4 +210,54 @@ func (c *Coordinator) Run(ctx context.Context) (*ImportStats, error) {
 	}
 
 	return stats, nil
+}
+
+// reportLiveProgress periodically logs live loading progress
+func (c *Coordinator) reportLiveProgress(ctx context.Context) {
+	log := logger.Get()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastPoints, lastLines, lastPolys int64
+	lastTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			points, lines, polys := c.loader.liveStats.GetStats()
+			now := time.Now()
+			elapsed := now.Sub(lastTime).Seconds()
+
+			// Calculate instantaneous rates (last 5 seconds)
+			var pointsRate, linesRate, polysRate float64
+			if elapsed > 0 {
+				pointsRate = float64(points-lastPoints) / elapsed
+				linesRate = float64(lines-lastLines) / elapsed
+				polysRate = float64(polys-lastPolys) / elapsed
+			}
+
+			// Get channel buffer utilization
+			wayCacheSize := c.extractor.wayCacheSize.Load()
+
+			total := points + lines + polys
+			totalRate := pointsRate + linesRate + polysRate
+
+			log.Info("Loading progress",
+				zap.Int64("points", points),
+				zap.Int64("lines", lines),
+				zap.Int64("polygons", polys),
+				zap.Int64("total", total),
+				zap.String("points_rate", FormatThroughput(pointsRate)),
+				zap.String("lines_rate", FormatThroughput(linesRate)),
+				zap.String("polys_rate", FormatThroughput(polysRate)),
+				zap.String("total_rate", FormatThroughput(totalRate)),
+				zap.Int64("way_cache", wayCacheSize),
+			)
+
+			lastPoints, lastLines, lastPolys = points, lines, polys
+			lastTime = now
+		}
+	}
 }

@@ -1,11 +1,20 @@
 package pipeline
 
+import "time"
+
 // GeometryRecord represents a single geometry for streaming between extractor and loader
 type GeometryRecord struct {
 	OsmID   int64
 	OsmType string // "N", "W", or "R"
 	Tags    string // JSON string
 	GeomWKB []byte
+
+	// Extra attributes (optional, only populated when ExtraAttributes is enabled)
+	Version   int
+	Changeset int64
+	Timestamp time.Time
+	User      string
+	UID       int
 }
 
 // GeometryStreams holds the three output channels from the streaming extractor

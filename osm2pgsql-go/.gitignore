@@ -1,4 +1,6 @@
 osm2pgsql-go
+osm2pgsql-go-test
+bin/
 testdata/
 osmdata/
 osm_data/

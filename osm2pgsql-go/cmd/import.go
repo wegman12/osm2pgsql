@@ -2,17 +2,28 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
 	"github.com/kevinramage/osm2pgsql-go/internal/pipeline"
+	"github.com/kevinramage/osm2pgsql-go/internal/proj"
 	"github.com/spf13/cobra"
 )
 
 var (
-	channelBuffer int
+	channelBuffer   int
+	bboxStr         string
+	projectionStr   string
+	styleFile       string
+	extraAttributes bool
+	hstore          bool
+	flatNodesFile   string
+	tablespaceMain  string
+	tablespaceIndex string
 )
 
 var importCmd = &cobra.Command{
@@ -36,11 +47,51 @@ func init() {
 	importCmd.Flags().BoolVar(&createIndexes, "create-indexes", true, "Create spatial indexes after loading")
 	importCmd.Flags().BoolVar(&dropExisting, "drop-existing", false, "Drop existing tables before loading")
 	importCmd.Flags().IntVar(&channelBuffer, "channel-buffer", 50000, "Buffer size for geometry channels")
+	importCmd.Flags().StringVarP(&bboxStr, "bbox", "b", "", "Bounding box filter: minlon,minlat,maxlon,maxlat")
+	importCmd.Flags().StringVarP(&projectionStr, "projection", "E", "4326", "Target projection SRID (4326 or 3857)")
+	importCmd.Flags().StringVarP(&styleFile, "style", "S", "", "Style YAML file for tag filtering")
+	importCmd.Flags().BoolVar(&extraAttributes, "extra-attributes", false, "Include changeset, timestamp, version, user columns")
+	importCmd.Flags().BoolVar(&hstore, "hstore", false, "Use hstore instead of JSONB for tags column")
+	importCmd.Flags().StringVar(&flatNodesFile, "flat-nodes", "", "Path to flat nodes file (faster for large imports)")
+	importCmd.Flags().StringVar(&tablespaceMain, "tablespace-main", "", "Tablespace for main tables")
+	importCmd.Flags().StringVar(&tablespaceIndex, "tablespace-index", "", "Tablespace for indexes")
 }
 
 func runImport(cmd *cobra.Command, args []string) {
 	cfg.InputFile = args[0]
 	log := logger.Get()
+
+	// Parse bounding box if provided
+	if bboxStr != "" {
+		bbox, err := config.ParseBBox(bboxStr)
+		if err != nil {
+			exitWithError("invalid bbox", err)
+		}
+		cfg.BBox = bbox
+	}
+
+	// Parse projection
+	srid, err := proj.ParseSRID(projectionStr)
+	if err != nil {
+		exitWithError("invalid projection", err)
+	}
+	cfg.Projection = srid
+
+	// Set style file
+	cfg.StyleFile = styleFile
+
+	// Set extra attributes
+	cfg.ExtraAttributes = extraAttributes
+
+	// Set hstore mode
+	cfg.Hstore = hstore
+
+	// Set flat nodes file
+	cfg.FlatNodesFile = flatNodesFile
+
+	// Set tablespace settings
+	cfg.TablespaceMain = tablespaceMain
+	cfg.TablespaceIndex = tablespaceIndex
 
 	if err := cfg.Validate(); err != nil {
 		exitWithError("invalid configuration", err)
@@ -48,12 +99,22 @@ func runImport(cmd *cobra.Command, args []string) {
 
 	totalStart := time.Now()
 
-	log.Info("Starting osm2pgsql-go pipelined import",
+	// Build log fields
+	logFields := []zap.Field{
 		zap.String("input", cfg.InputFile),
-		zap.String("output", cfg.DBHost+":"+string(rune(cfg.DBPort))+"/"+cfg.DBName),
+		zap.String("output", fmt.Sprintf("%s:%d/%s", cfg.DBHost, cfg.DBPort, cfg.DBName)),
 		zap.Int("workers", cfg.Workers),
 		zap.Int("channel_buffer", channelBuffer),
-	)
+		zap.Int("projection", cfg.Projection),
+	}
+	if cfg.BBox != nil && cfg.BBox.IsSet {
+		logFields = append(logFields, zap.String("bbox",
+			fmt.Sprintf("%.4f,%.4f,%.4f,%.4f", cfg.BBox.MinLon, cfg.BBox.MinLat, cfg.BBox.MaxLon, cfg.BBox.MaxLat)))
+	}
+	if cfg.StyleFile != "" {
+		logFields = append(logFields, zap.String("style", cfg.StyleFile))
+	}
+	log.Info("Starting osm2pgsql-go pipelined import", logFields...)
 
 	// Create pipeline coordinator
 	pipeCfg := pipeline.CoordinatorConfig{
