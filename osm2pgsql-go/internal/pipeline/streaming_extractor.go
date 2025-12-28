@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,9 +72,10 @@ func NewStreamingExtractor(cfg *config.Config, channelBuffer int) (*StreamingExt
 		channelBuffer = 50000
 	}
 
-	// Load style configuration if provided
+	// Load style configuration if provided (skip for Lua files - handled separately)
 	var styleCfg *style.Config
-	if cfg.StyleFile != "" {
+	isLuaStyle := strings.HasSuffix(strings.ToLower(cfg.StyleFile), ".lua")
+	if cfg.StyleFile != "" && !isLuaStyle {
 		var err error
 		styleCfg, err = style.LoadConfig(cfg.StyleFile)
 		if err != nil {
