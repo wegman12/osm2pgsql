@@ -10,8 +10,10 @@ require (
 	github.com/paulmach/osm v0.8.0
 	github.com/shirou/gopsutil/v4 v4.25.11
 	github.com/spf13/cobra v1.8.0
+	github.com/yuin/gopher-lua v1.1.1
 	go.uber.org/zap v1.27.1
 	golang.org/x/sync v0.4.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -62,5 +64,4 @@ require (
 	google.golang.org/protobuf v1.31.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

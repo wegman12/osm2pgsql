@@ -1,6 +1,10 @@
 package pipeline
 
-import "time"
+import (
+	"time"
+
+	"github.com/kevinramage/osm2pgsql-go/internal/middle"
+)
 
 // GeometryRecord represents a single geometry for streaming between extractor and loader
 type GeometryRecord struct {
@@ -23,6 +27,11 @@ type GeometryStreams struct {
 	Lines    <-chan GeometryRecord
 	Polygons <-chan GeometryRecord
 	Errors   <-chan error
+
+	// Raw OSM data streams (only populated when SlimMode is enabled)
+	RawNodes     <-chan middle.RawNode
+	RawWays      <-chan middle.RawWay
+	RawRelations <-chan middle.RawRelation
 }
 
 // ExtractStats holds extraction statistics

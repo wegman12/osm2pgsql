@@ -96,6 +96,11 @@ func (l *StreamingLoader) LiveStats() *LiveLoadStats {
 	return l.liveStats
 }
 
+// Pool returns the underlying connection pool (for sharing with MiddleStore)
+func (l *StreamingLoader) Pool() *pgxpool.Pool {
+	return l.pool
+}
+
 // Close closes all database connections
 func (l *StreamingLoader) Close() error {
 	l.pool.Close()

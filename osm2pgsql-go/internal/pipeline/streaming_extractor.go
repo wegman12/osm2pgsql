@@ -16,6 +16,7 @@ import (
 
 	"github.com/kevinramage/osm2pgsql-go/internal/config"
 	"github.com/kevinramage/osm2pgsql-go/internal/logger"
+	"github.com/kevinramage/osm2pgsql-go/internal/middle"
 	"github.com/kevinramage/osm2pgsql-go/internal/nodeindex"
 	"github.com/kevinramage/osm2pgsql-go/internal/proj"
 	"github.com/kevinramage/osm2pgsql-go/internal/style"
@@ -260,6 +261,16 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 	polygonsChan := make(chan GeometryRecord, e.channelBuffer)
 	errChan := make(chan error, 1)
 
+	// Raw data channels for slim mode (middle tables)
+	var rawNodesChan chan middle.RawNode
+	var rawWaysChan chan middle.RawWay
+	var rawRelationsChan chan middle.RawRelation
+	if e.cfg.SlimMode {
+		rawNodesChan = make(chan middle.RawNode, e.channelBuffer)
+		rawWaysChan = make(chan middle.RawWay, e.channelBuffer)
+		rawRelationsChan = make(chan middle.RawRelation, e.channelBuffer)
+	}
+
 	// Internal work distribution channels
 	nodeChan := make(chan *osm.Node, 10000)
 	wayChan := make(chan *osm.Way, 10000)
@@ -282,10 +293,12 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 			defer wg.Done()
 			encoder := wkb.NewEncoderWithSRID(1024, e.cfg.Projection)
 			coords := make([]float64, 0, 2000)
+			nodeIDs := make([]int64, 0, 500) // For slim mode
 
 			for way := range wayChan {
 				wayCount.Add(1)
 				coords = coords[:0]
+				nodeIDs = nodeIDs[:0]
 
 				// Build coordinate array from node references
 				valid := true
@@ -297,6 +310,7 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 						break
 					}
 					coords = append(coords, lon, lat)
+					nodeIDs = append(nodeIDs, int64(nodeRef.ID))
 					// Check if any node is in bbox
 					if !inBBox && bbox.Contains(lat, lon) {
 						inBBox = true
@@ -306,6 +320,29 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 				// Skip if invalid or no nodes in bbox
 				if !valid || len(coords) < 4 || !inBBox {
 					continue
+				}
+
+				// Emit raw way data for slim mode (before any filtering)
+				if e.cfg.SlimMode && rawWaysChan != nil {
+					nodeIDsCopy := make([]int64, len(nodeIDs))
+					copy(nodeIDsCopy, nodeIDs)
+					rawWay := middle.RawWay{
+						ID:    int64(way.ID),
+						Nodes: nodeIDsCopy,
+						Tags:  tagsToMap(way.Tags),
+					}
+					if e.cfg.ExtraAttributes {
+						rawWay.Version = int32(way.Version)
+						rawWay.Changeset = int64(way.ChangesetID)
+						rawWay.Timestamp = way.Timestamp
+						rawWay.User = way.User
+						rawWay.UID = int32(way.UserID)
+					}
+					select {
+					case rawWaysChan <- rawWay:
+					case <-ctx.Done():
+						return
+					}
 				}
 
 				// Cache way coordinates for relation processing
@@ -385,6 +422,28 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 				continue
 			}
 
+			// Emit raw node data for slim mode (all nodes, not just tagged ones)
+			if e.cfg.SlimMode && rawNodesChan != nil {
+				rawNode := middle.RawNode{
+					ID:   int64(node.ID),
+					Lat:  middle.ScaleCoord(node.Lat),
+					Lon:  middle.ScaleCoord(node.Lon),
+					Tags: tagsToMap(node.Tags),
+				}
+				if e.cfg.ExtraAttributes {
+					rawNode.Version = int32(node.Version)
+					rawNode.Changeset = int64(node.ChangesetID)
+					rawNode.Timestamp = node.Timestamp
+					rawNode.User = node.User
+					rawNode.UID = int32(node.UserID)
+				}
+				select {
+				case rawNodesChan <- rawNode:
+				case <-ctx.Done():
+					return
+				}
+			}
+
 			if len(node.Tags) > 0 && hasMeaningfulTags(node.Tags) {
 				// Apply style filter
 				if e.pointFilter.HasFilter() && !e.pointFilter.Match(tagsToMap(node.Tags)) {
@@ -428,7 +487,45 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 		for rel := range relationChan {
 			relCount.Add(1)
 
-			// Only handle multipolygon relations
+			// Emit raw relation data for slim mode (all relations, not just multipolygons)
+			if e.cfg.SlimMode && rawRelationsChan != nil {
+				members := make([]middle.RelationMember, len(rel.Members))
+				for i, m := range rel.Members {
+					var memberType string
+					switch m.Type {
+					case osm.TypeNode:
+						memberType = "n"
+					case osm.TypeWay:
+						memberType = "w"
+					case osm.TypeRelation:
+						memberType = "r"
+					}
+					members[i] = middle.RelationMember{
+						Type: memberType,
+						Ref:  int64(m.Ref),
+						Role: m.Role,
+					}
+				}
+				rawRel := middle.RawRelation{
+					ID:      int64(rel.ID),
+					Members: members,
+					Tags:    tagsToMap(rel.Tags),
+				}
+				if e.cfg.ExtraAttributes {
+					rawRel.Version = int32(rel.Version)
+					rawRel.Changeset = int64(rel.ChangesetID)
+					rawRel.Timestamp = rel.Timestamp
+					rawRel.User = rel.User
+					rawRel.UID = int32(rel.UserID)
+				}
+				select {
+				case rawRelationsChan <- rawRel:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			// Only handle multipolygon relations for geometry output
 			if !isMultipolygonRelation(rel) {
 				continue
 			}
@@ -626,6 +723,19 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 		close(relationChan)
 		wg.Wait()
 
+		// Close raw data channels for slim mode
+		if e.cfg.SlimMode {
+			if rawNodesChan != nil {
+				close(rawNodesChan)
+			}
+			if rawWaysChan != nil {
+				close(rawWaysChan)
+			}
+			if rawRelationsChan != nil {
+				close(rawRelationsChan)
+			}
+		}
+
 		// Clear way cache after relation processing is complete
 		e.wayCache = sync.Map{}
 		e.wayCacheSize.Store(0)
@@ -642,12 +752,21 @@ func (e *StreamingExtractor) buildGeometriesStreaming(ctx context.Context, f *os
 			zap.Int64("relations", relCount.Load()))
 	}()
 
-	return &GeometryStreams{
+	streams := &GeometryStreams{
 		Points:   pointsChan,
 		Lines:    linesChan,
 		Polygons: polygonsChan,
 		Errors:   errChan,
 	}
+
+	// Add raw data channels for slim mode
+	if e.cfg.SlimMode {
+		streams.RawNodes = rawNodesChan
+		streams.RawWays = rawWaysChan
+		streams.RawRelations = rawRelationsChan
+	}
+
+	return streams
 }
 
 // geometryResult holds the result of processing a single geometry (internal)

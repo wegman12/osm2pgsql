@@ -94,6 +94,16 @@ type Config struct {
 	Hstore          bool   // Use hstore instead of JSONB for tags
 	FlatNodesFile   string // Path to flat nodes file (alternative to mmap)
 
+	// Slim mode (middle tables for incremental updates)
+	SlimMode   bool // Enable middle table storage
+	AppendMode bool // Apply changes instead of full import
+	DropMiddle bool // Drop middle tables after import
+
+	// Tile expiry settings
+	ExpireOutput  string // Path to expire tiles output file
+	ExpireMinZoom int    // Minimum zoom level for tile expiry
+	ExpireMaxZoom int    // Maximum zoom level for tile expiry
+
 	// Tablespace settings
 	TablespaceMain  string // Tablespace for main tables
 	TablespaceIndex string // Tablespace for indexes

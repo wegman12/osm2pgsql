@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -24,6 +25,12 @@ var (
 	flatNodesFile   string
 	tablespaceMain  string
 	tablespaceIndex string
+	slimMode        bool
+	appendMode      bool
+	dropMiddle      bool
+	expireOutput    string
+	expireMinZoom   int
+	expireMaxZoom   int
 )
 
 var importCmd = &cobra.Command{
@@ -55,6 +62,12 @@ func init() {
 	importCmd.Flags().StringVar(&flatNodesFile, "flat-nodes", "", "Path to flat nodes file (faster for large imports)")
 	importCmd.Flags().StringVar(&tablespaceMain, "tablespace-main", "", "Tablespace for main tables")
 	importCmd.Flags().StringVar(&tablespaceIndex, "tablespace-index", "", "Tablespace for indexes")
+	importCmd.Flags().BoolVar(&slimMode, "slim", false, "Enable slim mode (store raw OSM data for incremental updates)")
+	importCmd.Flags().BoolVar(&appendMode, "append", false, "Apply OSC file as update (requires existing slim tables)")
+	importCmd.Flags().BoolVar(&dropMiddle, "drop", false, "Drop slim tables after import")
+	importCmd.Flags().StringVarP(&expireOutput, "expire-output", "e", "", "Path to expire tiles output file")
+	importCmd.Flags().IntVar(&expireMinZoom, "expire-min-zoom", 1, "Minimum zoom level for tile expiry")
+	importCmd.Flags().IntVar(&expireMaxZoom, "expire-max-zoom", 18, "Maximum zoom level for tile expiry")
 }
 
 func runImport(cmd *cobra.Command, args []string) {
@@ -93,6 +106,16 @@ func runImport(cmd *cobra.Command, args []string) {
 	cfg.TablespaceMain = tablespaceMain
 	cfg.TablespaceIndex = tablespaceIndex
 
+	// Set slim mode settings
+	cfg.SlimMode = slimMode
+	cfg.AppendMode = appendMode
+	cfg.DropMiddle = dropMiddle
+
+	// Set expire settings
+	cfg.ExpireOutput = expireOutput
+	cfg.ExpireMinZoom = expireMinZoom
+	cfg.ExpireMaxZoom = expireMaxZoom
+
 	if err := cfg.Validate(); err != nil {
 		exitWithError("invalid configuration", err)
 	}
@@ -114,6 +137,12 @@ func runImport(cmd *cobra.Command, args []string) {
 	if cfg.StyleFile != "" {
 		logFields = append(logFields, zap.String("style", cfg.StyleFile))
 	}
+	if cfg.SlimMode {
+		logFields = append(logFields, zap.Bool("slim", true))
+	}
+	if cfg.AppendMode {
+		logFields = append(logFields, zap.Bool("append", true))
+	}
 	log.Info("Starting osm2pgsql-go pipelined import", logFields...)
 
 	// Create pipeline coordinator
@@ -129,8 +158,55 @@ func runImport(cmd *cobra.Command, args []string) {
 	}
 	defer coordinator.Close()
 
-	// Run pipelined import
 	ctx := context.Background()
+
+	// Check if append mode
+	if cfg.AppendMode {
+		// Append mode: apply OSC changes
+		appendStats, err := coordinator.RunAppend(ctx, cfg.InputFile)
+		if err != nil {
+			exitWithError("append failed", err)
+		}
+
+		totalElapsed := time.Since(totalStart)
+		log.Info("Append complete",
+			zap.Duration("total_time", totalElapsed.Round(time.Second)),
+			zap.Int64("nodes_processed", appendStats.NodesProcessed),
+			zap.Int64("ways_processed", appendStats.WaysProcessed),
+			zap.Int64("relations_processed", appendStats.RelationsProcessed),
+			zap.Int64("ways_rebuilt", appendStats.WaysRebuilt),
+			zap.Int64("relations_rebuilt", appendStats.RelationsRebuilt),
+			zap.Int64("points_updated", appendStats.PointsUpdated),
+			zap.Int64("lines_updated", appendStats.LinesUpdated),
+			zap.Int64("polygons_updated", appendStats.PolygonsUpdated),
+		)
+		return
+	}
+
+	// Check if using Lua Flex style
+	isLuaStyle := strings.HasSuffix(strings.ToLower(cfg.StyleFile), ".lua")
+	if isLuaStyle {
+		// Flex mode: use Lua style for custom table definitions
+		log.Info("Using Lua Flex style", zap.String("style", cfg.StyleFile))
+		flexStats, err := coordinator.RunFlex(ctx, cfg.StyleFile)
+		if err != nil {
+			exitWithError("flex import failed", err)
+		}
+
+		totalElapsed := time.Since(totalStart)
+		log.Info("Flex import complete",
+			zap.Duration("total_time", totalElapsed.Round(time.Second)),
+			zap.Int64("nodes_processed", flexStats.NodesProcessed),
+			zap.Int64("ways_processed", flexStats.WaysProcessed),
+			zap.Int64("relations_processed", flexStats.RelationsProcessed),
+			zap.Int64("rows_inserted", flexStats.RowsInserted),
+			zap.Strings("tables", flexStats.Tables),
+			zap.Float64("throughput_mb_s", float64(flexStats.BytesRead)/(1024*1024)/totalElapsed.Seconds()),
+		)
+		return
+	}
+
+	// Normal import mode
 	stats, err := coordinator.Run(ctx)
 	if err != nil {
 		exitWithError("import failed", err)
