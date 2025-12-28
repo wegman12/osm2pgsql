@@ -417,7 +417,7 @@ func (pp *ParallelProcessor) EnsureTables(ctx context.Context, dropExisting bool
 	log := logger.Get()
 
 	for _, table := range pp.tables.All() {
-		fullName := fmt.Sprintf("%s.%s", table.Schema, table.Name)
+		fullName := fmt.Sprintf("\"%s\".\"%s\"", table.Schema, table.Name)
 
 		if dropExisting {
 			_, err := pp.pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", fullName))
@@ -442,12 +442,13 @@ func (pp *ParallelProcessor) EnsureTables(ctx context.Context, dropExisting bool
 
 // buildCreateTableSQL generates CREATE TABLE SQL
 func (pp *ParallelProcessor) buildCreateTableSQL(table *Table) string {
-	fullName := fmt.Sprintf("%s.%s", table.Schema, table.Name)
+	fullName := fmt.Sprintf("\"%s\".\"%s\"", table.Schema, table.Name)
 	sql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", fullName)
 
 	var columns []string
 	for _, col := range table.Columns {
-		colDef := fmt.Sprintf("  %s %s", col.Name, col.Type.String())
+		// Quote column names to handle reserved words like "natural", "user", etc.
+		colDef := fmt.Sprintf("  \"%s\" %s", col.Name, col.Type.String())
 
 		if col.Type >= ColumnTypePoint && col.Type <= ColumnTypeGeometryCollection {
 			srid := col.SRID
@@ -458,7 +459,7 @@ func (pp *ParallelProcessor) buildCreateTableSQL(table *Table) string {
 				typeName := col.Type.String()
 				if len(typeName) > 10 && typeName[:8] == "GEOMETRY" {
 					geomType := typeName[9 : len(typeName)-1]
-					colDef = fmt.Sprintf("  %s GEOMETRY(%s, %d)", col.Name, geomType, srid)
+					colDef = fmt.Sprintf("  \"%s\" GEOMETRY(%s, %d)", col.Name, geomType, srid)
 				}
 			}
 		}
@@ -480,11 +481,11 @@ func (pp *ParallelProcessor) CreateIndexes(ctx context.Context) error {
 	log := logger.Get()
 
 	for _, table := range pp.tables.All() {
-		fullName := fmt.Sprintf("%s.%s", table.Schema, table.Name)
+		fullName := fmt.Sprintf("\"%s\".\"%s\"", table.Schema, table.Name)
 
 		if table.GeomColumn != "" {
 			indexName := fmt.Sprintf("%s_%s_idx", table.Name, table.GeomColumn)
-			sql := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING GIST (%s)",
+			sql := fmt.Sprintf("CREATE INDEX IF NOT EXISTS \"%s\" ON %s USING GIST (\"%s\")",
 				indexName, fullName, table.GeomColumn)
 
 			log.Debug("Creating index", zap.String("index", indexName))
@@ -496,7 +497,7 @@ func (pp *ParallelProcessor) CreateIndexes(ctx context.Context) error {
 
 		for _, colName := range table.Indexes {
 			indexName := fmt.Sprintf("%s_%s_idx", table.Name, colName)
-			sql := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)",
+			sql := fmt.Sprintf("CREATE INDEX IF NOT EXISTS \"%s\" ON %s (\"%s\")",
 				indexName, fullName, colName)
 
 			log.Debug("Creating index", zap.String("index", indexName))
@@ -508,7 +509,7 @@ func (pp *ParallelProcessor) CreateIndexes(ctx context.Context) error {
 
 		if table.ClusterOn != "" {
 			indexName := fmt.Sprintf("%s_%s_idx", table.Name, table.ClusterOn)
-			sql := fmt.Sprintf("CLUSTER %s USING %s", fullName, indexName)
+			sql := fmt.Sprintf("CLUSTER %s USING \"%s\"", fullName, indexName)
 			log.Debug("Clustering table", zap.String("table", fullName))
 			_, _ = pp.pool.Exec(ctx, sql)
 		}
